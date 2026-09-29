@@ -1,0 +1,10 @@
+# build artifacts
+game
+game_cpu
+*.o
+*.obj
+*.exe
+*.exp
+*.lib
+*.pdb
+build/
