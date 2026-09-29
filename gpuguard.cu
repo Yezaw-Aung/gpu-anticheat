@@ -42,6 +42,17 @@
 #define RING_N 256
 #define GG_SLACK 8      // flow-control headroom: cap in-flight at RING_N - GG_SLACK
 
+// DEMO ONLY: on Windows, export gg_submit from the game.exe so the injected cheat
+// DLL can resolve it with GetProcAddress. This is a convenience for the T1
+// code-injection demonstration (attack/); a real cheat would locate gg_submit by
+// signature scanning instead. The security point is identical either way: once
+// code runs in the process, it can drive the game's own write channel.
+#ifdef _WIN32
+#define GG_EXPORT extern "C" __declspec(dllexport)
+#else
+#define GG_EXPORT extern "C"
+#endif
+
 struct Req { uint32_t slot, seq; int32_t arg; uint32_t op; };   // 16B, one load
 
 // GPU-WRITE, HOST-READ only. Every engine INPUT (ring, doorbell, stop flag) lives
@@ -246,7 +257,7 @@ extern "C" void gg_shutdown(void)
 
 extern "C" int gg_active(void) { return g_up ? 1 : 0; }
 
-extern "C" uint64_t gg_submit(int slot, int op, int32_t arg)
+GG_EXPORT uint64_t gg_submit(int slot, int op, int32_t arg)   // GG_EXPORT: exported on Windows for the injection demo
 {
     if (!g_up || slot < 0 || slot >= GG_MAX_SLOTS) return UINT64_MAX;
     std::lock_guard<std::mutex> lk(g_lock);
