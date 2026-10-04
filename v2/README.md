@@ -1,0 +1,81 @@
+# v2 — the rule-reward engine
+
+**Version 2** of the GPU anti-cheat: the GPU is the **authority over protected
+game state**, not merely a monitor of it. The host cannot name a protected value;
+it can only submit a **trigger** (`MOVE`, `SHOOT`, `ATTACK`, ...), and the
+persistent GPU engine decides the result from its own authoritative prior state
+plus a GPU-resident rule table. This removes v1's raw write channel — the
+confused-deputy / direct-forge hole — and replaces it with a bounded one.
+
+Read **`../DESIGN_v2.md`** for the threat model, the exact invariant, the honest
+limitations, the related-work comparison, and the experiment plan. This README is
+just how to build and drive it.
+
+## The model in one line
+
+> A protected value changes **only** through a transition the GPU-resident rules
+> accept, evaluated against the GPU's **own** authoritative prior state. The CPU
+> proposes; the GPU decides. Score is GPU-owned and rises only on a GPU-adjudicated
+> kill.
+
+## The core experiment: two combat modes
+
+The CPU-heavy op (`ATTACK`) is verified in one of two modes, selected **before
+launch** by `GG_COMBAT_MODE`:
+
+| mode | `GG_COMBAT_MODE` | what the GPU does with CPU-claimed damage | T1 max-damage cheat |
+|---|---|---|---|
+| **REDERIVE** | `0` (default) | **ignores it**, recomputes from a GPU-owned roll + rules | **neutralised** (claim discarded; `mismatch` counter climbs) |
+| **BOUNDS** | `1` | **trusts it** if `0 ≤ dmg ≤ max_dmg[weapon]` | **works, but bounded** (max-roll every swing) |
+
+The measurable gap between these two modes — cheat score/DPS in BOUNDS vs
+REDERIVE, at equal honest baseline — is the paper's central result. It shows GPU
+authority prevents the T1 cheat **exactly** on operations the GPU fully re-derives,
+and degrades to mere bounds-enforcement otherwise.
+
+## Build & run
+
+```bash
+make                 # GPU build (needs nvcc) -> ./game
+make cpu             # CPU stub (no CUDA)      -> ./game_cpu   (UNPROTECTED banner)
+make ARCH=sm_86      # override arch if -arch=native is unavailable
+
+GG_COMBAT_MODE=0 ./game      # REDERIVE
+GG_COMBAT_MODE=1 ./game      # BOUNDS
+```
+
+The CPU stub runs the **identical** rule core (`game_rules.cuh`), so the economy
+behaves the same on a laptop — it just protects nothing (no GPU authority). Use it
+to develop game logic; use the GPU build for any security claim or measurement.
+
+## Commands
+
+```
+move <l|r|u|d>   shoot   reload   tick   item        # GPU-friendly ops
+attack [weapon]                                       # CPU-heavy op (honest)
+cheat_score                                           # show the v1 forge is inexpressible
+cheat_attack [n]                                      # T1: max claimed damage x n
+tamper                                                # T0: external page edit (healed+flagged)
+score | status | addrs | bench [n] | help | quit
+```
+
+## Files
+
+- `game.cpp` — the terminal combat game (host side: triggers only, read-only state).
+- `game_rules.cuh` — **the rule core**: slot layout, trigger vocabulary, the rule
+  table, and `gg_apply_rule()`. Compiled by **both** nvcc (engine) and the host
+  (stub), so the enforced rule and the simulated rule are the same source.
+- `gpuguard.h` — the C ABI: `gg_trigger` (the only write-side entry), no raw write.
+- `gpuguard.cu` — the persistent engine (shared-memory shadows, device ring +
+  one-way doorbell, per-request verdict) and the host shim.
+- `gpuguard_stub.cpp` — the no-GPU stub; runs the same rules, guards nothing.
+- `protected.h` — the **read-only** game-facing view (header-only; no write path).
+- `attack/` — the T1 injection demo and the honest contrast with v1.
+
+## Relationship to v1
+
+The repository root is **v1**, the raw write channel. Its `forge` command and
+`attack/` injection demo show the confused-deputy hole. Run the same class of
+attack here to see it bounded (REDERIVE) or at least shaped (BOUNDS), and the
+direct score-forge gone entirely. Keeping both versions is deliberate: the paper's
+argument is the **delta** between them.
