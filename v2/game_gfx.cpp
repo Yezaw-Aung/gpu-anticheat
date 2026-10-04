@@ -3,22 +3,25 @@
 // Same security model as the terminal frontend -- ONLY presentation differs.
 // Every state change goes through gg_trigger() and is decided by the GPU engine
 // against its authoritative shadow + rules; every value drawn is read from the
-// GPU-healed mirror page via gg_rd(). The GPU now owns monster HP, armor AND
-// POSITIONS, so spatial rules (melee range) are GPU-enforced, not CPU-trusted.
+// GPU-healed mirror page via gg_rd(). The GPU owns monster HP, armor AND
+// POSITIONS, so melee range is GPU-enforced, not CPU-trusted.
 //
-// Arena: WASD/arrows move the player; aim with the mouse; bullets fly where you
-// click/shoot. GG_NMON monsters chase you (the GPU moves them via MONSTER_STEP)
-// and deal contact damage. Melee only lands when you are within melee range of a
-// monster -- the GPU rejects out-of-range swings.
+// *** REAL-TIME NOTE ***
+// The hot loop is FIRE-AND-FORGET: it submits triggers and never calls gg_wait().
+// Blocking on a GPU round-trip every frame is what made input laggy (the engine
+// shares the GPU with OpenGL, so each synchronous round-trip can stall for ms).
+// Instead we submit asynchronously and read the mirror page the engine heals --
+// the GPU stays authoritative, the frame rate stays at the 60 FPS target, and
+// simultaneous key presses work because movement is level-triggered (held keys),
+// not edge-triggered.
 //
 // Controls
-//   WASD / arrows  MOVE
+//   WASD / arrows  MOVE (hold to keep moving; press two for diagonals)
 //   mouse          aim
-//   SPACE / LMB    SHOOT (spawns a bullet; the GPU gates ammo + cooldown)
-//   F / RMB        MELEE attack nearest monster (GPU range-gates it)
+//   SPACE / LMB    SHOOT (hold to auto-fire; GPU gates ammo + cooldown)
+//   F / RMB        MELEE nearest monster (GPU range-gates it)
 //   C              MELEE as a T1 cheat: claim MAX damage (works only in BOUNDS)
-//   1..4           select weapon
-//   R  reload   E  use item (heal)   X  try to forge score   T  tamper score page
+//   1..4 weapon   R reload   E item   X forge-score (impossible)   T tamper
 
 #include "raylib.h"
 
@@ -34,15 +37,20 @@
 #include "game_rules.cuh"
 #include "game_common.h"
 
-static const int GRID = 32;
-static const int CELL = 20;
-static const int PLAY = GRID * CELL;        // 640
-static const int HUD  = 320;
-static const int WINW = PLAY + HUD;
-static const int WINH = PLAY;
+static const int   GRID = 32;
+static const int   CELL = 20;
+static const int   PLAY = GRID * CELL;      // 640
+static const int   HUD  = 320;
+static const int   WINW = PLAY + HUD;
+static const int   WINH = PLAY;
 static const float MON_R    = CELL * 0.75f;
 static const float BULLET_R = 4.0f;
 static const float BULLET_V = 8.0f;
+
+// Timing knobs (seconds). Monsters step slower now; movement/fire repeat fast.
+static const double MON_STEP_PERIOD = 0.45;   // was 0.25 -> monsters are slower
+static const double MOVE_PERIOD     = 0.06;   // grid move repeat while held
+static const double FIRE_PERIOD     = 0.12;   // auto-fire cadence while held
 
 struct Bullet { float x, y, vx, vy; int weapon; bool alive; };
 
@@ -62,9 +70,9 @@ struct Log {
 	}
 } g_log;
 
-static const char* verdictStr(int v) { return v == GG_APPLIED ? "APPLIED" : "REJECTED"; }
+// fire-and-forget submit: never blocks on the engine
+static inline void sub(int op, int a0, int a1, int a2, int a3) { gg_trigger(op, a0, a1, a2, a3); }
 
-// pixel center of a grid cell
 static inline float gx(int cx) { return cx * (float)CELL + CELL * 0.5f; }
 
 static void drawBar(int x, int y, int w, int h, float frac, Color fill, const char* label) {
@@ -75,7 +83,6 @@ static void drawBar(int x, int y, int w, int h, float frac, Color fill, const ch
 	DrawText(label, x + 6, y + h/2 - 8, 16, BLACK);
 }
 
-// nearest living monster to the player (grid distance); -1 if none
 static int nearestMonster(int px, int py) {
 	int best = -1; long bestd = 1L<<30;
 	for (int i = 0; i < GG_NMON; i++) {
@@ -87,21 +94,23 @@ static int nearestMonster(int px, int py) {
 	return best;
 }
 
-static void meleeAttack(int weapon, bool cheat) {
-	int px = gg_rd(SLOT_POSX), py = gg_rd(SLOT_POSY);
+// Fire-and-forget melee; client-side range note is cosmetic (the GPU decides).
+static void meleeAttack(int weapon, bool cheat, int px, int py) {
 	int k = nearestMonster(px, py);
 	if (k < 0) { g_log.push("MELEE: no monster"); return; }
 	int hp = gg_rd(MON_HP(k));
 	int32_t claim = gg_cpu_attack_calc(g_rng, weapon, cheat);
-	int v = gg_wait(gg_trigger(GG_TRIG_ATTACK, k, hp, claim, weapon));
+	sub(GG_TRIG_ATTACK, k, hp, claim, weapon);
+	long dx = px - gg_rd(MON_POSX(k)), dy = py - gg_rd(MON_POSY(k));
+	bool inRange = dx*dx + dy*dy <= 9;
 	char b[96];
-	snprintf(b, sizeof b, "%sMELEE m%d w%d claim=%d %s",
-	         cheat ? "CHEAT " : "", k, weapon, claim, verdictStr(v));
+	snprintf(b, sizeof b, "%sMELEE m%d w%d %s", cheat ? "CHEAT " : "", k, weapon,
+	         inRange ? "(in range)" : "(too far -> GPU rejects)");
 	g_log.push(b);
 }
 
 int main() {
-	gg_setup_slots();   // allocate every slot in canonical order, before launch
+	gg_setup_slots();
 	gg_start();
 
 	InitWindow(WINW, WINH, "GPU Rule-Reward Game (v2)");
@@ -111,57 +120,64 @@ int main() {
 	int flashBlocked = 0;
 	std::vector<Bullet> bullets;
 	double lastStep = GetTime();
+	double moveAccum = 0, fireAccum = 0;
 	g_log.push(gg_active() ? "GPU engine active" : "CPU STUB - unprotected");
 	g_log.push(std::string("mode: ") + modeName());
 
 	while (!WindowShouldClose()) {
-		// ---- per-frame housekeeping ----
-		gg_wait(gg_trigger(GG_TRIG_TICK, 0, 0, 0, 0));
+		double dt = GetFrameTime();
 
-		// monsters step on a wall-clock timer (CPU-driven tempo -- see DESIGN §11)
-		if (GetTime() - lastStep > 0.25) {
-			gg_wait(gg_trigger(GG_TRIG_MONSTER_STEP, 0, 0, 0, 0));
+		// ---- per-frame + timed world triggers (fire-and-forget) ----
+		sub(GG_TRIG_TICK, 0, 0, 0, 0);
+		if (GetTime() - lastStep > MON_STEP_PERIOD) {
+			sub(GG_TRIG_MONSTER_STEP, 0, 0, 0, 0);
 			lastStep = GetTime();
 		}
 
-		// ---- input ----
+		// ---- weapon select ----
 		if (IsKeyPressed(KEY_ONE))   weapon = 0;
 		if (IsKeyPressed(KEY_TWO))   weapon = 1;
 		if (IsKeyPressed(KEY_THREE)) weapon = 2;
 		if (IsKeyPressed(KEY_FOUR))  weapon = 3;
 
-		auto move = [&](int dir, const char* name) {
-			int v = gg_wait(gg_trigger(GG_TRIG_MOVE, dir, 0, 0, 0));
-			if (v != GG_APPLIED) { flashBlocked = 12; g_log.push(std::string("MOVE ")+name+" REJECTED (edge)"); }
-		};
-		if (IsKeyPressed(KEY_A) || IsKeyPressed(KEY_LEFT))  move(0, "L");
-		if (IsKeyPressed(KEY_D) || IsKeyPressed(KEY_RIGHT)) move(1, "R");
-		if (IsKeyPressed(KEY_W) || IsKeyPressed(KEY_UP))    move(2, "U");
-		if (IsKeyPressed(KEY_S) || IsKeyPressed(KEY_DOWN))  move(3, "D");
-
 		int px = gg_rd(SLOT_POSX), py = gg_rd(SLOT_POSY);
+
+		// ---- movement: level-triggered + repeat timer, so held keys and
+		//      diagonals (two keys at once) both work, independent of frame rate ----
+		moveAccum += dt;
+		if (moveAccum >= MOVE_PERIOD) {
+			bool moved = false, blocked = false;
+			bool L = IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT);
+			bool R = IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT);
+			bool U = IsKeyDown(KEY_W) || IsKeyDown(KEY_UP);
+			bool D = IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN);
+			if (L) { if (px > 0)  sub(GG_TRIG_MOVE,0,0,0,0); else blocked = true; moved = true; }
+			if (R) { if (px < 31) sub(GG_TRIG_MOVE,1,0,0,0); else blocked = true; moved = true; }
+			if (U) { if (py > 0)  sub(GG_TRIG_MOVE,2,0,0,0); else blocked = true; moved = true; }
+			if (D) { if (py < 31) sub(GG_TRIG_MOVE,3,0,0,0); else blocked = true; moved = true; }
+			if (moved) moveAccum = 0;
+			if (blocked) flashBlocked = 10;
+		}
+
 		float pcx = gx(px), pcy = gx(py);
 		Vector2 mouse = GetMousePosition();
 
-		// SHOOT -> if the GPU accepts (ammo + cooldown), spawn a bullet toward aim
-		if (IsKeyPressed(KEY_SPACE) || IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-			int v = gg_wait(gg_trigger(GG_TRIG_SHOOT, 0, 0, 0, 0));
-			if (v == GG_APPLIED) {
-				float dx = mouse.x - pcx, dy = mouse.y - pcy;
-				float len = std::sqrt(dx*dx + dy*dy); if (len < 1e-3f) { dx = 1; dy = 0; len = 1; }
-				bullets.push_back({ pcx, pcy, dx/len*BULLET_V, dy/len*BULLET_V, weapon, true });
-			} else {
-				g_log.push("SHOOT REJECTED (no ammo / cooling)");
-			}
+		// ---- shoot: hold to auto-fire; client cadence + mirror ammo/cooldown
+		//      gate the VISUAL bullet, the GPU gates the real ammo ----
+		fireAccum += dt;
+		bool firing = IsKeyDown(KEY_SPACE) || IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+		if (firing && fireAccum >= FIRE_PERIOD && gg_rd(SLOT_AMMO) > 0 && gg_rd(SLOT_WEAPON_CD) == 0) {
+			sub(GG_TRIG_SHOOT, 0, 0, 0, 0);
+			float dx = mouse.x - pcx, dy = mouse.y - pcy;
+			float len = std::sqrt(dx*dx + dy*dy); if (len < 1e-3f) { dx = 1; dy = 0; len = 1; }
+			bullets.push_back({ pcx, pcy, dx/len*BULLET_V, dy/len*BULLET_V, weapon, true });
+			fireAccum = 0;
 		}
 
-		if (IsKeyPressed(KEY_F) || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) meleeAttack(weapon, false);
-		if (IsKeyPressed(KEY_C)) meleeAttack(weapon, true);
-		if (IsKeyPressed(KEY_R)) { gg_wait(gg_trigger(GG_TRIG_RELOAD,0,0,0,0)); g_log.push("RELOAD"); }
-		if (IsKeyPressed(KEY_E)) {
-			int v = gg_wait(gg_trigger(GG_TRIG_USE_ITEM,0,0,0,0));
-			g_log.push(std::string("USE_ITEM ") + verdictStr(v));
-		}
+		if (IsKeyPressed(KEY_F) || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) meleeAttack(weapon, false, px, py);
+		if (IsKeyPressed(KEY_C)) meleeAttack(weapon, true, px, py);
+		if (IsKeyPressed(KEY_R)) { sub(GG_TRIG_RELOAD,0,0,0,0); g_log.push("RELOAD"); }
+		if (IsKeyPressed(KEY_E)) { sub(GG_TRIG_USE_ITEM,0,0,0,0); g_log.push("USE_ITEM (heal if score+room)"); }
 		if (IsKeyPressed(KEY_X)) g_log.push("forge score: NO SUCH TRIGGER (impossible in v2)");
 		if (IsKeyPressed(KEY_T)) {
 			volatile uint32_t* p = gg_slot_ptr(SLOT_SCORE);
@@ -169,7 +185,7 @@ int main() {
 			g_log.push("TAMPER: poked score page (watch it heal)");
 		}
 
-		// ---- advance bullets + resolve hits against authoritative monster pos ----
+		// ---- advance bullets + resolve hits (fire-and-forget BULLET_HIT) ----
 		for (auto& b : bullets) {
 			if (!b.alive) continue;
 			b.x += b.vx; b.y += b.vy;
@@ -181,9 +197,7 @@ int main() {
 				float dx = b.x - mx, dy = b.y - my;
 				if (dx*dx + dy*dy <= (MON_R + BULLET_R)*(MON_R + BULLET_R)) {
 					int32_t claim = gg_cpu_attack_calc(g_rng, b.weapon, false);
-					int v = gg_wait(gg_trigger(GG_TRIG_BULLET_HIT, i, hp, claim, b.weapon));
-					char bb[80]; snprintf(bb, sizeof bb, "BULLET m%d w%d %s", i, b.weapon, verdictStr(v));
-					g_log.push(bb);
+					sub(GG_TRIG_BULLET_HIT, i, hp, claim, b.weapon);
 					b.alive = false;
 					break;
 				}
@@ -207,7 +221,6 @@ int main() {
 			DrawLine(0, i*CELL, PLAY, i*CELL, Fade(LIGHTGRAY, 0.6f));
 		}
 
-		// monsters
 		for (int i = 0; i < GG_NMON; i++) {
 			int mhp = gg_rd(MON_HP(i));
 			if (mhp <= 0) continue;
@@ -219,22 +232,22 @@ int main() {
 			DrawText(TextFormat("%d", i), (int)(mx-4), (int)(my-7), 14, WHITE);
 		}
 
-		// melee range ring
-		DrawCircleLines((int)pcx, (int)pcy, std::sqrt((float)9) * CELL, Fade(DARKBLUE, 0.25f));
-
-		// player + aim
+		DrawCircleLines((int)pcx, (int)pcy, 3.0f * CELL, Fade(DARKBLUE, 0.25f));   // melee range ring
 		DrawCircle((int)pcx, (int)pcy, CELL*0.6f, CLITERAL(Color){50,100,200,255});
 		DrawCircleLines((int)pcx, (int)pcy, CELL*0.6f, DARKBLUE);
 		if (flashBlocked > 0) { DrawCircleLines((int)pcx, (int)pcy, CELL*0.9f, RED); flashBlocked--; }
-		DrawLineEx({pcx,pcy}, mouse, 1.5f, Fade(DARKGRAY, 0.5f));
-
-		// bullets
+		DrawLineEx(CLITERAL(Vector2){pcx,pcy}, mouse, 1.5f, Fade(DARKGRAY, 0.5f));
 		for (auto& b : bullets) DrawCircle((int)b.x, (int)b.y, BULLET_R, CLITERAL(Color){30,30,30,255});
 
 		// HUD
 		int hx = PLAY + 16, hy = 14;
 		DrawRectangle(PLAY, 0, HUD, PLAY, CLITERAL(Color){250,250,252,255});
 		DrawLine(PLAY, 0, PLAY, PLAY, LIGHTGRAY);
+
+		// FPS (top-right); green when at/above 55
+		DrawText(TextFormat("%d FPS", GetFPS()), WINW - 74, 12, 16,
+		         GetFPS() >= 55 ? DARKGREEN : (GetFPS() >= 40 ? ORANGE : RED));
+
 		DrawText(gg_active() ? "GPU ENGINE ACTIVE" : "CPU STUB (UNPROTECTED)",
 		         hx, hy, 18, gg_active() ? DARKGREEN : RED); hy += 26;
 		DrawText(modeName(), hx, hy, 13, DARKGRAY); hy += 24;
