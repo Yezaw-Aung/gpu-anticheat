@@ -178,7 +178,7 @@ int main() {
 		ClearBackground(RAYWHITE);
 
 		// play area
-		DrawRectangle(0, 0, PLAY, PLAY, (Color){245,245,250,255});
+		DrawRectangle(0, 0, PLAY, PLAY, CLITERAL(Color){245,245,250,255});
 		for (int i = 0; i <= GRID; i += 4) {
 			DrawLine(i*CELL, 0, i*CELL, PLAY, Fade(LIGHTGRAY, 0.6f));
 			DrawLine(0, i*CELL, PLAY, i*CELL, Fade(LIGHTGRAY, 0.6f));
@@ -186,7 +186,7 @@ int main() {
 
 		// monster (top center) with HP bar
 		int mx = (GRID/2) * CELL, my = 2 * CELL;
-		DrawRectangle(mx - 24, my - 24, 48, 48, (Color){180,60,60,255});
+		DrawRectangle(mx - 24, my - 24, 48, 48, CLITERAL(Color){180,60,60,255});
 		DrawRectangleLines(mx - 24, my - 24, 48, 48, MAROON);
 		DrawRectangle(mx - 40, my - 44, 80, 8, Fade(GRAY, 0.4f));
 		DrawRectangle(mx - 40, my - 44, (int)(80 * (mhp / 120.0f)), 8, RED);
@@ -194,13 +194,13 @@ int main() {
 
 		// player
 		int cx = px * CELL + CELL/2, cy = py * CELL + CELL/2;
-		DrawCircle(cx, cy, CELL*0.7f, (Color){50,100,200,255});
+		DrawCircle(cx, cy, CELL*0.7f, CLITERAL(Color){50,100,200,255});
 		DrawCircleLines(cx, cy, CELL*0.7f, DARKBLUE);
 		if (flashBlocked > 0) { DrawCircleLines(cx, cy, CELL*0.95f, RED); flashBlocked--; }
 
 		// HUD panel
 		int hx = PLAY + 16, hy = 14;
-		DrawRectangle(PLAY, 0, HUD, PLAY, (Color){250,250,252,255});
+		DrawRectangle(PLAY, 0, HUD, PLAY, CLITERAL(Color){250,250,252,255});
 		DrawLine(PLAY, 0, PLAY, PLAY, LIGHTGRAY);
 
 		DrawText(gg_active() ? "GPU ENGINE ACTIVE" : "CPU STUB (UNPROTECTED)",
@@ -208,17 +208,17 @@ int main() {
 		DrawText(modeName(), hx, hy, 13, DARKGRAY); hy += 24;
 
 		drawBar(hx, hy, HUD-32, 22, hp/100.0f, GREEN, TextFormat("HP %d", hp)); hy += 30;
-		drawBar(hx, hy, HUD-32, 22, ammo/12.0f, (Color){40,120,220,255}, TextFormat("AMMO %d", ammo)); hy += 30;
+		drawBar(hx, hy, HUD-32, 22, ammo/12.0f, CLITERAL(Color){40,120,220,255}, TextFormat("AMMO %d", ammo)); hy += 30;
 		drawBar(hx, hy, HUD-32, 22, cd/3.0f, ORANGE, TextFormat("COOLDOWN %d", cd)); hy += 34;
 
-		DrawText(TextFormat("SCORE  %d", score), hx, hy, 24, (Color){30,30,30,255}); hy += 30;
+		DrawText(TextFormat("SCORE  %d", score), hx, hy, 24, CLITERAL(Color){30,30,30,255}); hy += 30;
 		DrawText("(rises only on a GPU-adjudicated kill)", hx, hy, 12, GRAY); hy += 24;
 		DrawText(TextFormat("weapon: %d    pos: (%d,%d)", weapon, px, py), hx, hy, 14, DARKGRAY); hy += 26;
 
 		DrawText(TextFormat("engine  applied=%u  rejected=%u", gg_applied(), gg_rejected()),
 		         hx, hy, 13, DARKGRAY); hy += 18;
 		DrawText(TextFormat("cpu-damage-mismatch=%u", gg_mismatch()), hx, hy, 13,
-		         gg_mismatch() ? (Color){180,100,0,255} : DARKGRAY); hy += 24;
+		         gg_mismatch() ? CLITERAL(Color){180,100,0,255} : DARKGRAY); hy += 24;
 
 		if (tampered) {
 			DrawRectangle(hx-6, hy-4, HUD-20, 26, Fade(RED, 0.15f));
