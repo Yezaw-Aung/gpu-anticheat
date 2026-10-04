@@ -121,6 +121,12 @@ int main() {
 	std::vector<Bullet> bullets;
 	double lastStep = GetTime();
 	double moveAccum = 0, fireAccum = 0;
+
+	// Smoothly-animated monster render positions. The GPU owns the authoritative
+	// (integer grid) position; these glide toward it so movement looks continuous
+	// instead of snapping a whole cell each MONSTER_STEP.
+	float rmx[GG_NMON], rmy[GG_NMON];
+	bool  rinit = false;
 	g_log.push(gg_active() ? "GPU engine active" : "CPU STUB - unprotected");
 	g_log.push(std::string("mode: ") + modeName());
 
@@ -162,6 +168,19 @@ int main() {
 		float pcx = gx(px), pcy = gx(py);
 		Vector2 mouse = GetMousePosition();
 
+		// Ease each monster's rendered position toward its authoritative grid
+		// position (frame-rate-independent exponential smoothing). Snap instead of
+		// gliding on a big jump (a respawn teleports to a random cell).
+		float ease = 1.0f - std::exp(-(float)dt / 0.12f);
+		for (int i = 0; i < GG_NMON; i++) {
+			float tx = gx(gg_rd(MON_POSX(i))), ty = gx(gg_rd(MON_POSY(i)));
+			if (!rinit) { rmx[i] = tx; rmy[i] = ty; continue; }
+			float ddx = tx - rmx[i], ddy = ty - rmy[i];
+			if (ddx*ddx + ddy*ddy > (4.0f*CELL)*(4.0f*CELL)) { rmx[i] = tx; rmy[i] = ty; }
+			else { rmx[i] += ddx * ease; rmy[i] += ddy * ease; }
+		}
+		rinit = true;
+
 		// ---- shoot: hold to auto-fire; client cadence + mirror ammo/cooldown
 		//      gate the VISUAL bullet, the GPU gates the real ammo ----
 		fireAccum += dt;
@@ -193,7 +212,7 @@ int main() {
 			for (int i = 0; i < GG_NMON; i++) {
 				int hp = gg_rd(MON_HP(i));
 				if (hp <= 0) continue;
-				float mx = gx(gg_rd(MON_POSX(i))), my = gx(gg_rd(MON_POSY(i)));
+				float mx = rmx[i], my = rmy[i];                 // hit where it's drawn
 				float dx = b.x - mx, dy = b.y - my;
 				if (dx*dx + dy*dy <= (MON_R + BULLET_R)*(MON_R + BULLET_R)) {
 					int32_t claim = gg_cpu_attack_calc(g_rng, b.weapon, false);
@@ -224,7 +243,7 @@ int main() {
 		for (int i = 0; i < GG_NMON; i++) {
 			int mhp = gg_rd(MON_HP(i));
 			if (mhp <= 0) continue;
-			float mx = gx(gg_rd(MON_POSX(i))), my = gx(gg_rd(MON_POSY(i)));
+			float mx = rmx[i], my = rmy[i];                     // smoothed render position
 			DrawRectangle((int)(mx-MON_R), (int)(my-MON_R), (int)(MON_R*2), (int)(MON_R*2), CLITERAL(Color){180,60,60,255});
 			DrawRectangleLines((int)(mx-MON_R), (int)(my-MON_R), (int)(MON_R*2), (int)(MON_R*2), MAROON);
 			DrawRectangle((int)(mx-MON_R), (int)(my-MON_R-8), (int)(MON_R*2), 5, Fade(GRAY,0.4f));
