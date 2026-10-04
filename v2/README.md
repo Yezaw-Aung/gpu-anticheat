@@ -35,7 +35,49 @@ and degrades to mere bounds-enforcement otherwise.
 
 ## Build & run
 
+### Windows (CMake — the primary path)
+
+Install **Visual Studio 2022** (Desktop development with C++) and the **CUDA
+Toolkit**, then from a normal PowerShell or cmd prompt:
+
+```bat
+cmake -B build
+cmake --build build --config Release
+```
+
+This produces, side by side in `build\Release\`:
+
+- `game.exe` — the real GPU build,
+- `game_cpu.exe` — the CPU stub (no CUDA; guards nothing),
+- `cheat.dll` + `injector.exe` — the T1 injection demo (`attack/`).
+
+Run it (pick a combat mode with the `GG_COMBAT_MODE` env var):
+
+```bat
+set GG_COMBAT_MODE=0   &  .\build\Release\game.exe      :: REDERIVE (GPU recomputes)
+set GG_COMBAT_MODE=1   &  .\build\Release\game.exe      :: BOUNDS   (GPU trusts a cap)
+
+:: T1 demo, in a second terminal:
+.\build\Release\injector.exe game.exe .\build\Release\cheat.dll
+```
+
+If CMake < 3.24 rejects `native`, pass your GPU's arch (86 = RTX 30xx Ampere):
+`cmake -B build -DCMAKE_CUDA_ARCHITECTURES=86`. Disable the attack demo with
+`-DBUILD_ATTACK_DEMO=OFF`.
+
+> **TDR / watchdog.** The engine is a persistent kernel. Windows kills a kernel
+> that runs longer than ~2 s unless the GPU watchdog (TDR) is disabled — set
+> `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\TdrLevel = 0` and reboot,
+> or run the GPU without a display attached. Without this the engine is torn down.
+
+CMake configures even on a machine **without** the CUDA Toolkit — it warns and
+builds only `game_cpu` (the stub), so you can develop game logic anywhere.
+
+### Linux (CMake or Make)
+
 ```bash
+cmake -B build && cmake --build build      # -> build/game  (and build/game_cpu)
+# or the Makefile:
 make                 # GPU build (needs nvcc) -> ./game
 make cpu             # CPU stub (no CUDA)      -> ./game_cpu   (UNPROTECTED banner)
 make ARCH=sm_86      # override arch if -arch=native is unavailable

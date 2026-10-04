@@ -1,28 +1,101 @@
-# Cross-platform build for the v2 GPU rule-reward anti-cheat (Windows MSVC+CUDA, Linux).
+# Cross-platform CMake build for the v2 GPU rule-reward anti-cheat.
+# Primary build path on Windows (MSVC + CUDA Toolkit) and on Linux.
 #
-#   cmake -B build
-#   cmake --build build --config Release
+# ─────────────────────────────────────────────────────────────────────────────
+# WINDOWS QUICK START  (normal PowerShell or cmd; CUDA Toolkit + VS 2022 installed)
 #
-# Produces:  build/Release/game.exe (Windows)  or  build/game (Linux)
+#   cmake -B build                            :: configure (auto-detects your GPU)
+#   cmake --build build --config Release      :: build everything
 #
-# On Windows install Visual Studio 2022 (Desktop C++) + CUDA Toolkit; CMake finds
-# cl.exe and nvcc. If CMake < 3.24 rejects "native", pass the arch:
-#   cmake -B build -DCMAKE_CUDA_ARCHITECTURES=86      (86 = RTX 30xx Ampere)
+#   Run:  .\build\Release\game.exe
+#   T1 demo (separate terminal):
+#         .\build\Release\injector.exe game.exe .\build\Release\cheat.dll
+#
+#   If CMake < 3.24 rejects "native", pass your GPU arch (86 = RTX 30xx Ampere):
+#         cmake -B build -DCMAKE_CUDA_ARCHITECTURES=86
+#
+#   *** The persistent engine needs the GPU watchdog (TDR) disabled, or Windows
+#       kills the long-running kernel after ~2 s. See v2/README.md. ***
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# TARGETS
+#   game        the real GPU build (game.cpp + gpuguard.cu)      [needs CUDA]
+#   game_cpu    CPU stub, no CUDA, guards nothing (dev/laptop)   [always]
+#   cheat       attack/cheat.cpp -> cheat.dll (T1 demo)          [Windows only]
+#   injector    attack/injector.cpp -> injector.exe             [Windows only]
+#
+# Toggle the attack demo with -DBUILD_ATTACK_DEMO=OFF.
+# ─────────────────────────────────────────────────────────────────────────────
 
 cmake_minimum_required(VERSION 3.20)
-project(gpu_anticheat_v2 LANGUAGES CXX CUDA)
+
+# CXX is always required; CUDA is enabled only if a compiler is found, so this
+# project still configures (stub + attack demo) on a machine without the toolkit.
+project(gpu_anticheat_v2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 17)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES native)   # auto-detect (CMake >= 3.24)
+option(BUILD_ATTACK_DEMO "Build the T1 cheat.dll + injector.exe demo (Windows)" ON)
+
+# Put every binary in one place so the injector and cheat.dll sit next to game.exe.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# ── detect CUDA ──────────────────────────────────────────────────────────────
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)   # auto-detect the installed GPU (CMake >= 3.24)
+  endif()
+  set(GG_HAVE_CUDA TRUE)
+else()
+  message(WARNING
+    "No CUDA compiler found: building the CPU STUB only (game_cpu), which "
+    "PROTECTS NOTHING. Install the CUDA Toolkit to build the real 'game' target.")
+  set(GG_HAVE_CUDA FALSE)
 endif()
 
-# nvcc compiles the .cu, the host compiler the .cpp, nvcc links. protected.h is
-# header-only and game_rules.cuh is shared by both toolchains.
-add_executable(game game.cpp gpuguard.cu)
-
 find_package(Threads REQUIRED)
-target_link_libraries(game PRIVATE Threads::Threads)
+
+# ── the real GPU build ───────────────────────────────────────────────────────
+# nvcc compiles gpuguard.cu, the host compiler compiles game.cpp, nvcc links.
+# game_rules.cuh is shared by both; protected.h is header-only.
+if(GG_HAVE_CUDA)
+  add_executable(game game.cpp gpuguard.cu)
+  target_link_libraries(game PRIVATE Threads::Threads)
+  # On Windows the engine exports gg_trigger (via __declspec(dllexport) in the .cu)
+  # so the injected cheat.dll can resolve it. Also export it on the whole exe so a
+  # GetProcAddress(GetModuleHandle(NULL), "gg_trigger") succeeds for the demo.
+  if(WIN32)
+    set_target_properties(game PROPERTIES ENABLE_EXPORTS ON)
+  endif()
+endif()
+
+# ── CPU stub (builds anywhere; guards nothing) ───────────────────────────────
+add_executable(game_cpu game.cpp gpuguard_stub.cpp)
+target_link_libraries(game_cpu PRIVATE Threads::Threads)
+
+# ── T1 attack demo (Windows only) ────────────────────────────────────────────
+if(BUILD_ATTACK_DEMO AND WIN32)
+  add_library(cheat SHARED attack/cheat.cpp)
+  target_link_libraries(cheat PRIVATE user32)
+  set_target_properties(cheat PROPERTIES PREFIX "" OUTPUT_NAME "cheat")  # -> cheat.dll
+
+  add_executable(injector attack/injector.cpp)
+endif()
+
+# ── MSVC niceties ────────────────────────────────────────────────────────────
+if(MSVC)
+  add_compile_options(/EHsc)
+  # The persistent-kernel busy-waits in gg_wait; no special flags needed, but keep
+  # warnings sane across the mixed MSVC/nvcc build.
+  if(GG_HAVE_CUDA)
+    target_compile_options(game PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W3>)
+  endif()
+endif()
+
+message(STATUS "gpu-anticheat v2: CUDA=${GG_HAVE_CUDA}  attack-demo=${BUILD_ATTACK_DEMO}  platform=${CMAKE_SYSTEM_NAME}")
