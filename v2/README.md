@@ -64,12 +64,17 @@ set GG_COMBAT_MODE=1   &  .\build\Release\game_gfx.exe   :: BOUNDS   (GPU trusts
 .\build\Release\injector.exe game_gfx.exe .\build\Release\cheat.dll
 ```
 
-**Graphical controls:** `WASD`/arrows move · `SPACE` shoot · `R` reload · `E` use
-item · `1`–`4` select weapon · `F` honest attack · `C` **cheat** attack (max claim)
-· `X` try to forge score (shows it's impossible) · `T` tamper the score page (watch
-the GPU heal it and raise the alert). The HUD shows the live GPU-owned state, the
-engine counters, and the `cpu-damage-mismatch` counter that climbs in REDERIVE mode
-whenever the client lies.
+**Graphical controls:** `WASD`/arrows move · **mouse** aims · `SPACE`/left-click
+shoot a bullet · `F`/right-click melee the nearest monster · `C` **cheat** melee
+(max claim) · `1`–`4` weapon · `R` reload · `E` use item · `X` try to forge score
+(shows it's impossible) · `T` tamper the score page (watch the GPU heal it + alert).
+
+Five monsters chase you (the GPU moves them and they deal contact damage). **Melee
+only lands when you're within the blue range ring** — the GPU rejects out-of-range
+swings from its own authoritative positions, so a T1 cheat can't hit across the
+map. Bullets are CPU-simulated but damage is GPU-verified on hit. The HUD shows the
+live GPU-owned state, the engine counters, and the `cpu-damage-mismatch` counter
+that climbs in REDERIVE mode whenever the client lies about damage.
 
 If CMake < 3.24 rejects `native`, pass your GPU's arch (86 = RTX 30xx Ampere):
 `cmake -B build -DCMAKE_CUDA_ARCHITECTURES=86`. Disable the attack demo with
@@ -117,9 +122,12 @@ score | status | addrs | bench [n] | help | quit
   terminal game; only the presentation differs — it drives the same triggers and
   reads the same GPU-owned slots.
 - `game.cpp` — the terminal combat game (host side: triggers only, read-only state).
-- `game_rules.cuh` — **the rule core**: slot layout, trigger vocabulary, the rule
-  table, and `gg_apply_rule()`. Compiled by **both** nvcc (engine) and the host
-  (stub), so the enforced rule and the simulated rule are the same source.
+- `game_rules.cuh` — **the rule core**: slot layout (player + per-monster blocks),
+  trigger vocabulary (incl. `ATTACK` melee range-gate, `BULLET_HIT`, `MONSTER_STEP`),
+  the rule table, and `gg_apply_rule()`. Compiled by **both** nvcc (engine) and the
+  host (stub), so the enforced rule and the simulated rule are the same source.
+- `game_common.h` — shared host helpers: canonical slot allocation order
+  (`gg_setup_slots`), slot reader (`gg_rd`), and the CPU damage-proposal function.
 - `gpuguard.h` — the C ABI: `gg_trigger` (the only write-side entry), no raw write.
 - `gpuguard.cu` — the persistent engine (shared-memory shadows, device ring +
   one-way doorbell, per-request verdict) and the host shim.

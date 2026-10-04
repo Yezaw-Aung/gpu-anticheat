@@ -24,6 +24,7 @@ uint64_t g_seq  = 0;
 Rules    g_rules;
 bool     g_inited = false;
 uint32_t g_applied = 0, g_rejected = 0, g_mismatch = 0;
+uint8_t  g_verdict[256] = {0};   // per-seq verdict ring, so gg_wait is honest
 
 void ensure_rules() {
     if (g_inited) return;
@@ -67,10 +68,15 @@ extern "C" uint64_t gg_trigger(int op, int32_t a0, int32_t a1, int32_t a2, int32
     int ok = gg_apply_rule(g_shadow, &g_rules, &t, &mism);
     if (ok) g_applied++; else g_rejected++;
     g_mismatch += mism;
+    g_verdict[g_seq % 256] = ok ? GG_APPLIED : GG_REJECTED;
     return g_seq++;
 }
 
-extern "C" int gg_wait(uint64_t seq) { return seq == UINT64_MAX ? GG_PENDING : GG_APPLIED; }
+extern "C" int gg_wait(uint64_t seq)
+{
+    if (seq == UINT64_MAX) return GG_PENDING;
+    return (int)g_verdict[seq % 256];
+}
 
 extern "C" int      gg_tampered(void)    { return 0; }   // cannot detect anything
 extern "C" int      gg_tamper_slot(void) { return -1; }

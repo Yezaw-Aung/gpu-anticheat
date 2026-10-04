@@ -1,35 +1,32 @@
 // game_rules.cuh — the GPU-resident rule core.  [VERSION 2: rule-reward engine]
 //
-// This is the single source of truth for every protected transition. It is
-// compiled UNCHANGED by two toolchains:
-//   * nvcc, into the persistent device engine (gpuguard.cu) -> runs on the GPU,
-//     where the shadow state lives in on-chip shared memory the host cannot reach;
-//   * an ordinary C++ compiler, into the CPU stub (gpuguard_stub.cpp) -> so the
-//     game runs on a laptop with no CUDA, with IDENTICAL semantics (but no
-//     protection -- the stub is clearly labelled UNPROTECTED).
+// Compiled UNCHANGED by nvcc (the device engine in gpuguard.cu) and by an ordinary
+// C++ compiler (the CPU stub). gg_apply_rule() is PURE -- it touches only the
+// shadow array, the rule table, and the request -- which is why it compiles for
+// both and why the enforced rule and the simulated rule are literally one source.
 //
-// Compiling the same function in both places is a deliberate anti-drift measure:
-// the rule the GPU enforces and the rule the stub simulates are literally the
-// same source lines. gg_apply_rule() is PURE: it touches only the shadow array,
-// the rule table, and the request. No printf, no atomics, no CUDA intrinsics --
-// which is exactly why it compiles for the host too.
+// *** THE V2 MODEL ***
+// No raw write path. The host cannot name a protected value; it submits a TRIGGER
+// and the GPU decides the result from its OWN authoritative prior state + this
+// rule table. See DESIGN_v2.md for the threat model and the exact invariant.
 //
-// *** THE V2 MODEL, IN ONE SENTENCE ***
-// There is no raw write path. The host cannot name a protected value. It can only
-// submit a TRIGGER (MOVE/SHOOT/ATTACK/...), and the GPU decides the resulting
-// state from its OWN authoritative prior state plus this rule table. See
-// DESIGN_v2.md for the threat model and the exact invariant this enforces.
+// This version models a small top-down arena: a player and GG_NMON monsters. The
+// GPU owns every security-sensitive value, now INCLUDING monster positions, so it
+// can enforce spatial rules (melee range) that the CPU cannot forge:
+//   * melee ATTACK is REJECTED unless the player is within melee range of the
+//     target monster, checked against GPU-authoritative positions;
+//   * monsters chase the player and deal contact damage via the GPU's own rule;
+//   * bullets are proposed by the CPU (BULLET_HIT) and verified by the GPU.
+// Honest limits (DESIGN_v2.md): monster MOVEMENT TEMPO is CPU-driven (the host
+// decides when to send MONSTER_STEP) -> a rate cheat the GPU cannot bound; and a
+// bullet's TRAJECTORY is CPU-computed -> the GPU verifies liveness, range and
+// damage, but trusts that a bullet geometrically reached the monster.
 
 #ifndef GAME_RULES_CUH
 #define GAME_RULES_CUH
 
 #include <stdint.h>
 
-// __host__ __device__ under nvcc, plain inline for the host stub. The one token
-// that lets the same body live in both worlds: the engine calls these from the
-// device, while the host shim (gg_default_rules) and the CPU stub call them from
-// the host, so they must be callable from both -- hence __host__ __device__, not
-// __device__ alone.
 #if defined(__CUDACC__)
 #define GG_FN __host__ __device__ __forceinline__
 #else
@@ -37,106 +34,166 @@
 #endif
 
 // ---------------------------------------------------------------- state layout
-// The authoritative protected state is a flat array of uint32 "slots". Each slot
-// has a fixed semantic meaning below. In v2 the host NEVER writes these; it reads
-// a mirror page (for display) that the engine heals every iteration. The true
-// values live in GPU shared memory (engine) / a host array (stub, unprotected).
+// Fixed player/global slots, then a block of 4 slots per monster.
 enum {
     SLOT_HP = 0,     // player hit points
     SLOT_AMMO,       // rounds in the magazine
     SLOT_POSX,       // player x (grid)
     SLOT_POSY,       // player y (grid)
     SLOT_WEAPON_CD,  // frames until the weapon can fire again (0 = ready)
-    SLOT_MON_HP,     // current monster hit points
-    SLOT_MON_ARMOR,  // current monster armor (flat damage reduction)
-    SLOT_BUFF,       // 1 if a damage buff is active, else 0 (authoritative)
-    SLOT_RNG,        // GPU-owned RNG state (counter-based; CPU cannot predict/set)
-    SLOT_SCORE,      // GPU-OWNED reward. Rises ONLY when the engine adjudicates a
-                     // kill. There is no trigger that writes it directly.
-    SLOT_COUNT
+    SLOT_BUFF,       // 1 if a damage buff is active (authoritative)
+    SLOT_RNG,        // GPU-owned RNG state (CPU cannot predict/set)
+    SLOT_SCORE,      // GPU-OWNED reward; rises ONLY on a GPU-adjudicated kill
+    SLOT_MON_BASE    // first monster slot
 };
 
+#define GG_NMON 5                       // number of monsters
+#define GG_NWEAPONS 4
+
+// per-monster slots (i = 0 .. GG_NMON-1)
+#define MON_HP(i)    (SLOT_MON_BASE + (i)*4 + 0)
+#define MON_ARMOR(i) (SLOT_MON_BASE + (i)*4 + 1)
+#define MON_POSX(i)  (SLOT_MON_BASE + (i)*4 + 2)
+#define MON_POSY(i)  (SLOT_MON_BASE + (i)*4 + 3)
+
+#define SLOT_COUNT   (SLOT_MON_BASE + GG_NMON * 4)   // = 8 + 5*4 = 28
+
+// monster spawn/respawn stats (also used by the host to seed initial slots)
+#define GG_MON_HP_INIT    60
+#define GG_MON_ARMOR_INIT 3
+
 // --------------------------------------------------------------- the triggers
-// The complete vocabulary the host may speak. Note what is ABSENT: no SET, no ADD,
-// no "write score". Compare v1, whose vocabulary was {SET, ADD} on any slot.
 enum {
-    GG_TRIG_MOVE = 0,   // arg0 = dir (0=left,1=right,2=up,3=down)
-    GG_TRIG_SHOOT,      // (no args) consume ammo if ready
-    GG_TRIG_RELOAD,     // (no args) refill magazine
-    GG_TRIG_TICK,       // (no args) per-frame housekeeping (cooldown--, RNG step)
-    GG_TRIG_USE_ITEM,   // (no args) spend score to heal, capped
-    GG_TRIG_ATTACK,     // the CPU-HEAVY op. arg0=monster_slot(=SLOT_MON_HP),
-                        //   arg1=expected_monster_hp (CAS guard),
-                        //   arg2=claimed_damage (used only in BOUNDS mode),
-                        //   arg3=weapon_id
+    GG_TRIG_MOVE = 0,     // arg0 = dir (0=left,1=right,2=up,3=down)
+    GG_TRIG_SHOOT,        // consume ammo if ready (bullets are CPU-simulated)
+    GG_TRIG_RELOAD,
+    GG_TRIG_TICK,         // per-frame housekeeping (cooldown--, RNG step)
+    GG_TRIG_USE_ITEM,     // spend score to heal, capped
+    GG_TRIG_ATTACK,       // MELEE, range-gated. arg0=monster index,
+                          //   arg1=expected monster HP (CAS), arg2=claimed damage,
+                          //   arg3=weapon
+    GG_TRIG_BULLET_HIT,   // RANGED. same args as ATTACK; bullet-range gated
+    GG_TRIG_MONSTER_STEP, // move every living monster toward the player + contact dmg
     GG_TRIG_COUNT
 };
 
-// combat_mode values -- the CORE EXPERIMENT lever (see DESIGN_v2.md section 6).
+// combat_mode -- the core experiment lever (DESIGN_v2.md section 6).
 enum {
-    GG_MODE_REDERIVE = 0, // GPU recomputes damage from its OWN roll + rule params;
-                          //   the CPU's claimed_damage is IGNORED (only logged).
-                          //   This is the only mode in which the GPU is truly the
-                          //   authority over combat outcomes. T1 cannot inflate
-                          //   damage; it can at best pick the best legal weapon.
-    GG_MODE_BOUNDS = 1    // GPU trusts claimed_damage if 0 <= dmg <= max_dmg[w].
-                          //   This is the detect-vs-prevent TRAP: every transition
-                          //   is "legal", yet a T1 attacker submits max damage on
-                          //   every swing. The invariant holds; the cheat succeeds.
+    GG_MODE_REDERIVE = 0, // GPU recomputes damage from its own roll; claim ignored
+    GG_MODE_BOUNDS   = 1  // GPU trusts claimed damage within max_dmg[weapon]
 };
-
-#define GG_NWEAPONS 4
 
 // --------------------------------------------------------------- the rule table
-// Tunable rule PARAMETERS. The rule LOGIC is the code below; the knobs are data.
-// In the engine this struct lives in device memory, seeded once at launch, so the
-// host cannot edit it after startup (part of what makes the rules "GPU-resident").
-// DESIGN_v2.md is explicit that logic-in-code vs fully data-driven rules is a
-// spectrum; parameters-in-device-memory is sufficient for the invariant.
 struct Rules {
-    uint32_t combat_mode;        // GG_MODE_REDERIVE or GG_MODE_BOUNDS
+    uint32_t combat_mode;
 
-    int32_t  move_step;          // grid cells per MOVE
+    int32_t  move_step;
     int32_t  bound_min, bound_max;
 
-    int32_t  ammo_per_shot;      // ammo consumed per SHOOT
-    int32_t  weapon_cooldown;    // frames of cooldown after a SHOOT
-    int32_t  max_ammo;           // RELOAD target
+    int32_t  ammo_per_shot;
+    int32_t  weapon_cooldown;
+    int32_t  max_ammo;
 
-    int32_t  max_hp;             // HP cap (USE_ITEM)
-    int32_t  item_cost;          // score spent per USE_ITEM
-    int32_t  item_heal;          // HP restored per USE_ITEM
+    int32_t  max_hp;
+    int32_t  item_cost;
+    int32_t  item_heal;
 
-    int32_t  dmg_base[GG_NWEAPONS]; // re-derive: base damage per weapon
-    int32_t  dmg_var [GG_NWEAPONS]; // re-derive: roll-scaled variance per weapon
-    int32_t  max_dmg [GG_NWEAPONS]; // bounds: accepted claimed-damage ceiling
-    int32_t  buff_bonus;            // re-derive: flat bonus when SLOT_BUFF != 0
+    int32_t  dmg_base[GG_NWEAPONS];
+    int32_t  dmg_var [GG_NWEAPONS];
+    int32_t  max_dmg [GG_NWEAPONS];
+    int32_t  buff_bonus;
 
-    int32_t  kill_reward;        // score granted by the GPU on a kill
-    int32_t  mon_hp_max;         // monster respawn HP
-    int32_t  mon_armor;          // monster respawn armor
+    int32_t  kill_reward;
+    int32_t  mon_hp_max;
+    int32_t  mon_armor;
+
+    int32_t  melee_range2;    // squared melee range (grid cells^2)
+    int32_t  bullet_range2;   // squared bullet sanity range
+    int32_t  contact_range2;  // squared range at which a monster damages the player
+    int32_t  contact_dmg;     // HP lost per adjacent monster per MONSTER_STEP
 };
 
-// A single request as it sits in the ring. 24 bytes, one or two loads.
 struct Trig {
-    uint32_t seq;    // producer sequence; checked against the engine's register head
-    uint32_t op;     // GG_TRIG_*
+    uint32_t seq;
+    uint32_t op;
     int32_t  arg0, arg1, arg2, arg3;
 };
 
-// counter-based RNG step (LCG). GPU-owned: the attacker cannot set SLOT_RNG (no
-// write path) nor predict the next roll without the state, which never leaves the
-// GPU. This is what makes re-derive mode's roll un-forgeable.
 GG_FN uint32_t gg_rng_next(uint32_t s) { return s * 1664525u + 1013904223u; }
 
+// Compute the weapon damage for a hit. In REDERIVE mode the GPU rolls its own
+// damage and IGNORES the claim (counting disagreements as mismatches); in BOUNDS
+// mode it trusts the claim within [0, max_dmg[w]]. Returns -1 to signal an illegal
+// claim (bounds mode) so the caller rejects.
+GG_FN int32_t gg_weapon_damage(uint32_t* sh, const Rules* R, int w,
+                               int32_t claim, uint32_t* out_mismatch)
+{
+    int32_t dmg;
+    if (R->combat_mode == GG_MODE_REDERIVE) {
+        sh[SLOT_RNG] = gg_rng_next(sh[SLOT_RNG]);
+        int32_t roll = (int32_t)((sh[SLOT_RNG] >> 16) % 100u);   // 0..99
+        dmg = R->dmg_base[w] + (R->dmg_var[w] * roll) / 100;
+        if (sh[SLOT_BUFF]) dmg += R->buff_bonus;
+        if (out_mismatch && claim != dmg) (*out_mismatch)++;
+    } else {
+        dmg = claim;
+        if (dmg < 0 || dmg > R->max_dmg[w]) return -1;           // illegal claim
+    }
+    return dmg;
+}
+
+// Apply `dmg` (pre-armor) to monster i, then handle death: grant the GPU-owned
+// kill reward and respawn the monster at a pseudo-random position. PURE.
+GG_FN void gg_damage_monster(uint32_t* sh, const Rules* R, int i, int32_t dmg)
+{
+    dmg -= (int32_t)sh[MON_ARMOR(i)];
+    if (dmg < 0) dmg = 0;
+    int32_t hp = (int32_t)sh[MON_HP(i)] - dmg;
+    if (hp < 0) hp = 0;
+    sh[MON_HP(i)] = (uint32_t)hp;
+
+    if (hp == 0) {
+        sh[SLOT_SCORE] += (uint32_t)R->kill_reward;              // GPU-OWNED reward
+        // respawn at a GPU-chosen position (CPU cannot place it)
+        sh[SLOT_RNG] = gg_rng_next(sh[SLOT_RNG]);
+        uint32_t r = sh[SLOT_RNG];
+        int span = R->bound_max - R->bound_min + 1;
+        int nx = R->bound_min + (int)((r >> 8)  % (uint32_t)span);
+        int ny = R->bound_min + (int)((r >> 17) % (uint32_t)span);
+        sh[MON_POSX(i)]  = (uint32_t)nx;
+        sh[MON_POSY(i)]  = (uint32_t)ny;
+        sh[MON_HP(i)]    = (uint32_t)R->mon_hp_max;
+        sh[MON_ARMOR(i)] = (uint32_t)R->mon_armor;
+    }
+}
+
+// Shared body of melee ATTACK and ranged BULLET_HIT: validate target, CAS, and a
+// squared-distance range gate against AUTHORITATIVE positions, then damage.
+GG_FN int gg_hit_monster(uint32_t* sh, const Rules* R, const Trig* t,
+                         int32_t range2, uint32_t* out_mismatch)
+{
+    int i = (int)t->arg0;
+    if (i < 0 || i >= GG_NMON) return 0;
+    if (sh[MON_HP(i)] == 0) return 0;                            // already dead
+    if (sh[MON_HP(i)] != (uint32_t)t->arg1) return 0;           // stale CAS
+
+    int w = (int)t->arg3;
+    if (w < 0 || w >= GG_NWEAPONS) return 0;
+
+    // RANGE GATE (GPU-enforced, from authoritative positions). A T1 attacker
+    // cannot hit a monster it is not actually near -- this is the spatial rule
+    // the CPU is not trusted to check.
+    int dx = (int)sh[SLOT_POSX] - (int)sh[MON_POSX(i)];
+    int dy = (int)sh[SLOT_POSY] - (int)sh[MON_POSY(i)];
+    if (dx*dx + dy*dy > range2) return 0;                       // out of range
+
+    int32_t dmg = gg_weapon_damage(sh, R, w, t->arg2, out_mismatch);
+    if (dmg < 0) return 0;                                      // illegal claim
+    gg_damage_monster(sh, R, i, dmg);
+    return 1;
+}
+
 // ---------------------------------------------------------------- THE RULES
-// Evaluate one trigger against the authoritative shadow. Returns 1 if the
-// transition is valid and was applied to `sh`, 0 if rejected (shadow untouched on
-// the paths that reject before mutating). PURE: shadow + rules + request only.
-//
-// `out_mismatch` (may be null) counts, in re-derive mode, how often the CPU's
-// claimed_damage disagreed with the GPU's computed damage -- i.e. how often the
-// CPU helper lied or erred. Pure telemetry; it changes no decision.
 GG_FN int gg_apply_rule(uint32_t* sh, const Rules* R, const Trig* t,
                         uint32_t* out_mismatch)
 {
@@ -150,42 +207,35 @@ GG_FN int gg_apply_rule(uint32_t* sh, const Rules* R, const Trig* t,
         else if (dir == 1) nx += R->move_step;
         else if (dir == 2) ny -= R->move_step;
         else if (dir == 3) ny += R->move_step;
-        else return 0;                                  // unknown direction
+        else return 0;
         if (nx < R->bound_min || nx > R->bound_max ||
-            ny < R->bound_min || ny > R->bound_max)
-            return 0;                                   // out of bounds -> rejected
+            ny < R->bound_min || ny > R->bound_max) return 0;
         sh[SLOT_POSX] = (uint32_t)nx;
         sh[SLOT_POSY] = (uint32_t)ny;
         return 1;
     }
 
     case GG_TRIG_SHOOT: {
-        if ((int32_t)sh[SLOT_AMMO] < R->ammo_per_shot) return 0;  // out of ammo
-        if (sh[SLOT_WEAPON_CD] != 0)                    return 0;  // still cooling
+        if ((int32_t)sh[SLOT_AMMO] < R->ammo_per_shot) return 0;
+        if (sh[SLOT_WEAPON_CD] != 0)                   return 0;
         sh[SLOT_AMMO]      -= (uint32_t)R->ammo_per_shot;
         sh[SLOT_WEAPON_CD]  = (uint32_t)R->weapon_cooldown;
         return 1;
     }
 
-    case GG_TRIG_RELOAD: {
+    case GG_TRIG_RELOAD:
         sh[SLOT_AMMO]      = (uint32_t)R->max_ammo;
         sh[SLOT_WEAPON_CD] = 0;
         return 1;
-    }
 
-    case GG_TRIG_TICK: {
-        // Per-frame housekeeping. NOTE (DESIGN_v2.md section on the clock problem):
-        // a T1 attacker can spam TICK to clear weapon cooldown faster than real
-        // frames, a legal-but-abusive RATE cheat. This is a deliberate, documented
-        // limitation -- the GPU has no trusted wall clock to bound it.
+    case GG_TRIG_TICK:
         if (sh[SLOT_WEAPON_CD] > 0) sh[SLOT_WEAPON_CD] -= 1;
         sh[SLOT_RNG] = gg_rng_next(sh[SLOT_RNG]);
         return 1;
-    }
 
     case GG_TRIG_USE_ITEM: {
-        if ((int32_t)sh[SLOT_SCORE] < R->item_cost) return 0;     // can't afford
-        if ((int32_t)sh[SLOT_HP]   >= R->max_hp)    return 0;     // already full
+        if ((int32_t)sh[SLOT_SCORE] < R->item_cost) return 0;
+        if ((int32_t)sh[SLOT_HP]   >= R->max_hp)    return 0;
         sh[SLOT_SCORE] -= (uint32_t)R->item_cost;
         int32_t hp = (int32_t)sh[SLOT_HP] + R->item_heal;
         if (hp > R->max_hp) hp = R->max_hp;
@@ -193,61 +243,40 @@ GG_FN int gg_apply_rule(uint32_t* sh, const Rules* R, const Trig* t,
         return 1;
     }
 
-    case GG_TRIG_ATTACK: {
-        // CAS / stale guard: the request must cite the CURRENT authoritative
-        // monster HP. If another request (or a respawn) moved it, this one is
-        // stale and is rejected -- never misapplied. This is how ordering and
-        // the legitimate->malicious->legitimate transient race are defeated on
-        // the heavy path.
-        if ((int32_t)sh[SLOT_MON_HP] != t->arg1) return 0;
+    case GG_TRIG_ATTACK:      // melee: tight range gate
+        return gg_hit_monster(sh, R, t, R->melee_range2, out_mismatch);
 
-        int w = (int)t->arg3;
-        if (w < 0 || w >= GG_NWEAPONS) return 0;
+    case GG_TRIG_BULLET_HIT:  // ranged: generous range gate
+        return gg_hit_monster(sh, R, t, R->bullet_range2, out_mismatch);
 
-        int32_t dmg;
-        if (R->combat_mode == GG_MODE_REDERIVE) {
-            // TRUE AUTHORITY. Recompute damage from a GPU-owned roll and the rule
-            // table; the CPU's claimed_damage (arg2) is IGNORED. The buff is read
-            // from the authoritative slot, not from the request. A T1 attacker
-            // cannot inflate this -- the only freedom left is choosing a weapon.
-            sh[SLOT_RNG] = gg_rng_next(sh[SLOT_RNG]);
-            int32_t roll = (int32_t)((sh[SLOT_RNG] >> 16) % 100u);   // 0..99
-            dmg = R->dmg_base[w] + (R->dmg_var[w] * roll) / 100;
-            if (sh[SLOT_BUFF]) dmg += R->buff_bonus;
-            if (out_mismatch && t->arg2 != dmg) (*out_mismatch)++;   // CPU lied/erred
-        } else {
-            // BOUNDS mode: trust the CPU's claim within a ceiling. This is the
-            // trap -- a legal transition that a T1 attacker always maxes out.
-            dmg = t->arg2;
-            if (dmg < 0 || dmg > R->max_dmg[w]) return 0;
-        }
-
-        int32_t armor = (int32_t)sh[SLOT_MON_ARMOR];
-        dmg -= armor; if (dmg < 0) dmg = 0;
-
-        int32_t hp = (int32_t)sh[SLOT_MON_HP] - dmg;
-        if (hp < 0) hp = 0;
-        sh[SLOT_MON_HP] = (uint32_t)hp;
-
-        if (hp == 0) {
-            // GPU-OWNED REWARD. Score rises HERE AND NOWHERE ELSE. There is no
-            // trigger that writes score, so no in-process code can grant itself
-            // score without the GPU first adjudicating a kill from authoritative
-            // monster HP. This is v2's cleanest, strongest invariant.
-            sh[SLOT_SCORE]    += (uint32_t)R->kill_reward;
-            sh[SLOT_MON_HP]    = (uint32_t)R->mon_hp_max;     // respawn (authoritative)
-            sh[SLOT_MON_ARMOR] = (uint32_t)R->mon_armor;
+    case GG_TRIG_MONSTER_STEP: {
+        int px = (int)sh[SLOT_POSX], py = (int)sh[SLOT_POSY];
+        for (int i = 0; i < GG_NMON; i++) {
+            if (sh[MON_HP(i)] == 0) continue;
+            int mx = (int)sh[MON_POSX(i)], my = (int)sh[MON_POSY(i)];
+            if      (mx < px) mx++;  else if (mx > px) mx--;     // chase
+            if      (my < py) my++;  else if (my > py) my--;
+            if (mx < R->bound_min) mx = R->bound_min;
+            if (mx > R->bound_max) mx = R->bound_max;
+            if (my < R->bound_min) my = R->bound_min;
+            if (my > R->bound_max) my = R->bound_max;
+            sh[MON_POSX(i)] = (uint32_t)mx;
+            sh[MON_POSY(i)] = (uint32_t)my;
+            int cdx = px - mx, cdy = py - my;
+            if (cdx*cdx + cdy*cdy <= R->contact_range2) {        // contact damage
+                int32_t hp = (int32_t)sh[SLOT_HP] - R->contact_dmg;
+                if (hp < 0) hp = 0;
+                sh[SLOT_HP] = (uint32_t)hp;
+            }
         }
         return 1;
     }
 
     default:
-        return 0;   // unknown op -> rejected
+        return 0;
     }
 }
 
-// Sensible defaults for the demo economy. Shared by engine and stub so both start
-// identical. combat_mode is overridden at startup (env var / setter).
 GG_FN void gg_default_rules(Rules* R)
 {
     R->combat_mode    = GG_MODE_REDERIVE;
@@ -264,9 +293,13 @@ GG_FN void gg_default_rules(Rules* R)
     R->dmg_var [0]=10; R->dmg_var [1]=14; R->dmg_var [2]=20; R->dmg_var [3]=30;
     R->max_dmg [0]=25; R->max_dmg [1]=40; R->max_dmg [2]=60; R->max_dmg [3]=90;
     R->buff_bonus     = 15;
-    R->kill_reward    = 100;
-    R->mon_hp_max     = 120;
-    R->mon_armor      = 5;
+    R->kill_reward    = 50;
+    R->mon_hp_max     = GG_MON_HP_INIT;
+    R->mon_armor      = GG_MON_ARMOR_INIT;
+    R->melee_range2   = 9;     // within 3 cells
+    R->bullet_range2  = 900;   // within 30 cells (whole arena; bound, not block)
+    R->contact_range2 = 2;     // adjacent (incl. diagonal)
+    R->contact_dmg    = 4;
 }
 
 #endif // GAME_RULES_CUH

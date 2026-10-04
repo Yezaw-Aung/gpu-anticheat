@@ -30,9 +30,11 @@
 
 typedef uint64_t (*gg_trigger_t)(int, int32_t, int32_t, int32_t, int32_t);
 
-// slot / op constants mirrored from game_rules.cuh (kept in sync by hand here)
-enum { SLOT_MON_HP = 5 };
+// op / stat constants mirrored from game_rules.cuh (kept in sync by hand here).
+// ATTACK args: arg0 = monster INDEX, arg1 = expected monster HP (CAS),
+//              arg2 = claimed damage, arg3 = weapon.
 enum { GG_TRIG_ATTACK = 5 };
+enum { GG_MON_HP_INIT = 60 };   // a freshly spawned monster's HP
 
 static DWORD WINAPI go(LPVOID)
 {
@@ -42,26 +44,26 @@ static DWORD WINAPI go(LPVOID)
         return 1;
     }
 
-    // Try the v1-style forge first -- there is no trigger for it, so the best an
-    // attacker can do is spam ATTACK with max claimed damage (weapon 3, cap 90).
-    // In REDERIVE mode this changes nothing and trips the mismatch counter; in
-    // BOUNDS mode it lands max damage each swing. The attacker cannot tell or
-    // choose which mode the GPU is in.
-    for (int i = 0; i < 50; i++) {
-        // NOTE: we do not know the current monster HP from here without reading the
-        // mirror page; a real cheat would read gg_slot_ptr(SLOT_MON_HP). For the
-        // demo we cite 0 so the CAS guard rejects stale swings -- showing the
-        // ordering guard also constrains a blind in-process attacker.
-        trig(GG_TRIG_ATTACK, SLOT_MON_HP, /*expected*/0, /*claim*/90, /*weapon*/3);
-    }
+    // There is no trigger that writes score, so the best an in-process attacker can
+    // do is spam melee ATTACK with max claimed damage (weapon 3, cap 90) on
+    // monster 0. v2 bounds this THREE ways the attacker cannot avoid:
+    //   1. combat mode: REDERIVE ignores the claim (mismatch climbs); only BOUNDS
+    //      trusts it. The attacker cannot choose the mode.
+    //   2. RANGE: the GPU rejects the swing unless the player is within melee range
+    //      of monster 0 -- a spatial rule checked from authoritative positions.
+    //   3. CAS: each swing must cite the current monster HP; once HP moves, stale
+    //      swings are rejected. We cite the fresh-spawn HP, so at most the first
+    //      lands (if in range); the rest show the guard rejecting a blind attacker.
+    for (int i = 0; i < 50; i++)
+        trig(GG_TRIG_ATTACK, /*monster*/0, /*expected*/GG_MON_HP_INIT, /*claim*/90, /*weapon*/3);
 
     MessageBoxA(NULL,
-        "Injected code called gg_trigger(ATTACK, claim=90) x50.\n"
-        "Now type 'status' in the game:\n"
-        "  REDERIVE -> score unchanged, cpu-damage-mismatch climbs (lying client).\n"
-        "  BOUNDS   -> score rises, but only by rule-valid max-damage swings.\n"
-        "Either way, there is NO way to set score directly -- the v1 forge is gone.",
-        "cheat.dll — v2 bounds the forge", MB_OK | MB_ICONINFORMATION);
+        "Injected code called gg_trigger(ATTACK monster 0, claim=90) x50.\n"
+        "Now type 'status' / 'look' in the game:\n"
+        "  REDERIVE -> claim ignored, cpu-damage-mismatch climbs (lying client).\n"
+        "  BOUNDS   -> lands only while in range AND HP matches (rule-valid swings).\n"
+        "There is NO way to set score directly, and the GPU range-gates the hit.",
+        "cheat.dll - v2 bounds the forge", MB_OK | MB_ICONINFORMATION);
     return 0;
 }
 

@@ -96,6 +96,21 @@ it. It rises only inside the engine when an `ATTACK` drives monster HP to zero. 
 in-process code can grant score without the GPU first adjudicating a kill from
 authoritative monster HP.
 
+**Spatial authority (multi-monster build).** The prototype now holds `GG_NMON`
+monsters, each with GPU-authoritative HP, armor, **and position**. Because the GPU
+owns positions, it enforces a *spatial* rule the CPU is not trusted to check:
+melee `ATTACK` is rejected unless the player is within melee range of the target
+monster, computed from authoritative positions. A T1 attacker therefore cannot hit
+a monster it is not actually near — the range gate is part of the invariant, not a
+client-side courtesy. Monsters chase the player and deal contact damage via the
+GPU's `MONSTER_STEP` rule. Two honest limits this introduces, both already in the
+threat model: (a) the *tempo* of `MONSTER_STEP` is CPU-driven, so a T1 attacker can
+slow or freeze monster movement — the rate-cheat class of §11 (the GPU owns where
+monsters are, not when they move); (b) a bullet's *trajectory* is CPU-computed, so
+`BULLET_HIT` has the GPU verify the target's liveness, bullet-range bound, and
+damage, but trust that a bullet geometrically reached it. Melee carries no such
+trajectory trust — its range is fully GPU-checked.
+
 ---
 
 ## 3. The GPU rule system
