@@ -37,6 +37,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(BUILD_ATTACK_DEMO "Build the T1 cheat.dll + injector.exe demo (Windows)" ON)
+option(BUILD_GRAPHICS    "Build the raylib graphical frontend (fetched by CMake)" ON)
 
 # Put every binary in one place so the injector and cheat.dll sit next to game.exe.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -61,6 +62,25 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# ── raylib (graphical frontend) ──────────────────────────────────────────────
+# Fetched and built from source by CMake, so there is nothing to install. On
+# Windows it bundles everything it needs; on Linux it wants the usual X11/GL dev
+# packages. Turn it off with -DBUILD_GRAPHICS=OFF if you only want the terminal
+# and stub builds.
+if(BUILD_GRAPHICS)
+  include(FetchContent)
+  set(FETCHCONTENT_QUIET OFF)
+  set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(BUILD_GAMES    OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    raylib
+    GIT_REPOSITORY https://github.com/raysan5/raylib.git
+    GIT_TAG        5.5
+    GIT_SHALLOW    TRUE
+  )
+  FetchContent_MakeAvailable(raylib)
+endif()
+
 # ── the real GPU build ───────────────────────────────────────────────────────
 # nvcc compiles gpuguard.cu, the host compiler compiles game.cpp, nvcc links.
 # game_rules.cuh is shared by both; protected.h is header-only.
@@ -78,6 +98,22 @@ endif()
 # ── CPU stub (builds anywhere; guards nothing) ───────────────────────────────
 add_executable(game_cpu game.cpp gpuguard_stub.cpp)
 target_link_libraries(game_cpu PRIVATE Threads::Threads)
+
+# ── graphical frontend (raylib) ──────────────────────────────────────────────
+# game_gfx     : graphical + real GPU engine   [needs CUDA + graphics]
+# game_gfx_cpu : graphical + CPU stub           [needs graphics]
+if(BUILD_GRAPHICS)
+  if(GG_HAVE_CUDA)
+    add_executable(game_gfx game_gfx.cpp gpuguard.cu)
+    target_link_libraries(game_gfx PRIVATE raylib Threads::Threads)
+    if(WIN32)
+      set_target_properties(game_gfx PROPERTIES ENABLE_EXPORTS ON)  # export gg_trigger for the T1 demo
+    endif()
+  endif()
+
+  add_executable(game_gfx_cpu game_gfx.cpp gpuguard_stub.cpp)
+  target_link_libraries(game_gfx_cpu PRIVATE raylib Threads::Threads)
+endif()
 
 # ── T1 attack demo (Windows only) ────────────────────────────────────────────
 if(BUILD_ATTACK_DEMO AND WIN32)

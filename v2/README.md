@@ -45,25 +45,35 @@ cmake -B build
 cmake --build build --config Release
 ```
 
-This produces, side by side in `build\Release\`:
+The first configure downloads and builds **raylib** (the graphics library) via
+CMake FetchContent — nothing to install. This produces, side by side in
+`build\Release\`:
 
-- `game.exe` — the real GPU build,
-- `game_cpu.exe` — the CPU stub (no CUDA; guards nothing),
+- **`game_gfx.exe`** — the **graphical** GPU build (this is the one to run),
+- `game.exe` — the terminal GPU build,
+- `game_cpu.exe` / `game_gfx_cpu.exe` — CPU stubs (no CUDA; guard nothing),
 - `cheat.dll` + `injector.exe` — the T1 injection demo (`attack/`).
 
 Run it (pick a combat mode with the `GG_COMBAT_MODE` env var):
 
 ```bat
-set GG_COMBAT_MODE=0   &  .\build\Release\game.exe      :: REDERIVE (GPU recomputes)
-set GG_COMBAT_MODE=1   &  .\build\Release\game.exe      :: BOUNDS   (GPU trusts a cap)
+set GG_COMBAT_MODE=0   &  .\build\Release\game_gfx.exe   :: REDERIVE (GPU recomputes)
+set GG_COMBAT_MODE=1   &  .\build\Release\game_gfx.exe   :: BOUNDS   (GPU trusts a cap)
 
-:: T1 demo, in a second terminal:
-.\build\Release\injector.exe game.exe .\build\Release\cheat.dll
+:: T1 demo, in a second terminal (works against game_gfx.exe too):
+.\build\Release\injector.exe game_gfx.exe .\build\Release\cheat.dll
 ```
+
+**Graphical controls:** `WASD`/arrows move · `SPACE` shoot · `R` reload · `E` use
+item · `1`–`4` select weapon · `F` honest attack · `C` **cheat** attack (max claim)
+· `X` try to forge score (shows it's impossible) · `T` tamper the score page (watch
+the GPU heal it and raise the alert). The HUD shows the live GPU-owned state, the
+engine counters, and the `cpu-damage-mismatch` counter that climbs in REDERIVE mode
+whenever the client lies.
 
 If CMake < 3.24 rejects `native`, pass your GPU's arch (86 = RTX 30xx Ampere):
 `cmake -B build -DCMAKE_CUDA_ARCHITECTURES=86`. Disable the attack demo with
-`-DBUILD_ATTACK_DEMO=OFF`.
+`-DBUILD_ATTACK_DEMO=OFF`, or the graphical build with `-DBUILD_GRAPHICS=OFF`.
 
 > **TDR / watchdog.** The engine is a persistent kernel. Windows kills a kernel
 > that runs longer than ~2 s unless the GPU watchdog (TDR) is disabled — set
@@ -103,6 +113,9 @@ score | status | addrs | bench [n] | help | quit
 
 ## Files
 
+- `game_gfx.cpp` — the **graphical** frontend (raylib). Same security model as the
+  terminal game; only the presentation differs — it drives the same triggers and
+  reads the same GPU-owned slots.
 - `game.cpp` — the terminal combat game (host side: triggers only, read-only state).
 - `game_rules.cuh` — **the rule core**: slot layout, trigger vocabulary, the rule
   table, and `gg_apply_rule()`. Compiled by **both** nvcc (engine) and the host
