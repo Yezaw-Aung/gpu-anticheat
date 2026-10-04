@@ -30,6 +30,16 @@
 extern "C" {
 #endif
 
+// Export attribute for the one symbol the T1 demo resolves at runtime
+// (gg_trigger). It MUST sit on the declaration here so the declaration and the
+// definition in gpuguard.cu agree -- MSVC rejects a definition that ADDS
+// dllexport the declaration lacked. On non-Windows it expands to nothing.
+#ifdef _WIN32
+#define GG_API __declspec(dllexport)
+#else
+#define GG_API
+#endif
+
 // Sized to one block. One engine, SLOT_COUNT protected values; see game_rules.cuh.
 #define GG_MAX_SLOTS 256
 
@@ -78,7 +88,7 @@ volatile uint32_t *gg_slot_ptr(int slot);
 // too -- but, unlike v1's gg_submit, the worst it achieves is a RULE-VALID
 // transition, never an arbitrary value. (On Windows this is exported for the T1
 // demo, exactly as v1 exported gg_submit; see gpuguard.cu.)
-uint64_t gg_trigger(int op, int32_t arg0, int32_t arg1, int32_t arg2, int32_t arg3);
+GG_API uint64_t gg_trigger(int op, int32_t arg0, int32_t arg1, int32_t arg2, int32_t arg3);
 
 // Block until the engine has consumed `seq`, then return its verdict
 // (GG_APPLIED / GG_REJECTED). GG_PENDING only if seq is invalid.

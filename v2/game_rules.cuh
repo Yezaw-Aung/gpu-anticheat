@@ -25,10 +25,13 @@
 
 #include <stdint.h>
 
-// __device__ under nvcc, plain inline for the host stub. The one token that lets
-// the same body live in both worlds.
+// __host__ __device__ under nvcc, plain inline for the host stub. The one token
+// that lets the same body live in both worlds: the engine calls these from the
+// device, while the host shim (gg_default_rules) and the CPU stub call them from
+// the host, so they must be callable from both -- hence __host__ __device__, not
+// __device__ alone.
 #if defined(__CUDACC__)
-#define GG_FN __device__ __forceinline__
+#define GG_FN __host__ __device__ __forceinline__
 #else
 #define GG_FN inline
 #endif
